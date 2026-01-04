@@ -4,6 +4,7 @@ import heapq
 import json
 import logging
 import os
+import pickle
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -205,17 +206,111 @@ class DenseRetrievalExactSearch:
                     similarity_scores_top_k_values[query_itr],
                 ):
                     corpus_id = corpus_ids[corpus_start_idx + sub_corpus_id]
+                    embedding = sub_corpus_embeddings[sub_corpus_id]
                     if len(result_heaps[query_id]) < top_k:
                         # Push item on the heap
-                        heapq.heappush(result_heaps[query_id], (score, corpus_id))
+                        heapq.heappush(
+                            result_heaps[query_id],
+                            (score, corpus_id, sub_corpus_id, embedding),
+                        )
                     else:
                         # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
-                        heapq.heappushpop(result_heaps[query_id], (score, corpus_id))
+                        heapq.heappushpop(
+                            result_heaps[query_id],
+                            (score, corpus_id, sub_corpus_id, embedding),
+                        )
 
-        for qid in result_heaps:
-            for score, corpus_id in result_heaps[qid]:
+        logger.info("Collecting custom results.")
+        logger.info("Number of queries:", len(queries))
+        query_neighborhood = []
+        max_num_queries = 40
+        retrievability_c = 100
+        rng = np.random.default_rng(123)
+        sampled_ids = rng.choice(query_ids, size=max_num_queries, replace=False)
+        query_hashes = [
+            self.model.model.cache_dict[task_name]._hash_text(q) for q in queries
+        ]
+
+        # --------- Extension: Store query neighborhood + compute document retrievability -------------
+        retrievability_scores = {}
+
+        # Loop over queries
+        for qid in tqdm.tqdm(result_heaps):
+            if qid in sampled_ids:
+                query_idx = query_ids.index(qid)
+                query_embedding = query_embeddings[query_idx]
+                query = queries[query_idx]
+
+                payload = {
+                    "query": query,
+                    "query_hash": query_hashes[query_idx],
+                    "query_id": qid,
+                    "query_idx": query_idx,
+                    "query_embedding": query_embedding,
+                    "sim_scores": [],
+                    "hashes": [],
+                    "texts": [],
+                }
+
+            # Loop over results for each query
+            for score, corpus_id, sub_corpus_id, embedding in result_heaps[qid]:
                 self.results[qid][corpus_id] = score
 
+                # Update retrievability (if corpus_id has been seen based on this query)
+                if corpus_id not in retrievability_scores:
+                    retrievability_scores[corpus_id] = {
+                        "retrievability": 0,
+                        "hash": self.model.model.cache_dict[task_name]._hash_text(
+                            corpus[corpus_ids.index(corpus_id)]
+                        ),
+                        "document_text": corpus[corpus_ids.index(corpus_id)],
+                    }
+                result_ids = [r[1] for r in result_heaps[qid]]
+                rank = result_ids.index(corpus_id) + 1
+                # Increment if it has been retrieved
+                if rank <= retrievability_c:
+                    retrievability_scores[corpus_id]["retrievability"] += 1
+
+                if qid in sampled_ids:
+                    corpus_idx = corpus_ids.index(corpus_id)
+                    payload["texts"].append(corpus[corpus_idx])
+                    payload["hashes"].append(
+                        self.model.model.cache_dict[task_name]._hash_text(
+                            corpus[corpus_ids.index(corpus_id)]
+                        )
+                    )
+                    payload["sim_scores"].append(score)
+
+            if qid in sampled_ids:
+                query_neighborhood.append(payload)
+
+        # Store query data
+        results_path = "detailed_results/"
+        path = f"{results_path}{self.encode_kwargs['model_name']}"
+        os.makedirs(path, exist_ok=True)
+        with open(path + f"/{task_name}_query_neighborhood.pkl", "wb") as f:
+            pickle.dump(query_neighborhood, f)
+
+        # Store query hashes
+        query_hashes_path = f"{results_path}{self.encode_kwargs['model_name']}"
+        os.makedirs(query_hashes_path, exist_ok=True)
+        with open(query_hashes_path + f"/{task_name}_query_hashes.pkl", "wb") as f:
+            pickle.dump(
+                [
+                    (q, self.model.model.cache_dict[task_name]._hash_text(q))
+                    for q in queries
+                ],
+                f,
+            )
+
+        # Store retrievability data
+        retrievability_scores["query_ids"] = list(self.results.keys())
+        retrievability_path = f"{results_path}/{self.encode_kwargs['model_name']}"
+        os.makedirs(retrievability_path, exist_ok=True)
+        with open(
+            retrievability_path + f"/{task_name}_retrievability_scores.pkl", "wb"
+        ) as f:
+            pickle.dump(retrievability_scores, f)
         return self.results
 
     def load_results_file(self):
