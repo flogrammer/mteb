@@ -221,7 +221,7 @@ class DenseRetrievalExactSearch:
                         )
 
         logger.info("Collecting custom results.")
-        logger.info("Number of queries:", len(queries))
+        logger.info(f"Number of queries: {len(queries)}")
         query_neighborhood = []
         max_num_queries = 40
         retrievability_c = 100
